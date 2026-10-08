@@ -176,14 +176,8 @@ Make the heading in the template exactly match `LOG_HEADING`, including the numb
 
 ## Safety notes
 
-- The original personal script is not touched by this project.
+- The script does not modify its own source file.
 - A lock directory prevents simultaneous updates.
 - Temporary files are used while updating an existing note.
 - A SHA-256 check prevents replacing the note if another program changed it during the update.
 - The script does not delete journal content.
-
-## Separate Git repository
-
-Yes, a separate repository is worthwhile. This tool is independent from a personal Obsidian vault, keeps private paths and notes out of the public project, makes versioning easy, and lets other people install it without copying your vault.
-
-This directory is already structured as a standalone project. Before publishing it, review the script once more for personal names, paths or private metadata.

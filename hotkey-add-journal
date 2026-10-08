@@ -11,7 +11,7 @@ set -u
 # 3. Run: ./hotkey-add-journal --check
 # 4. Run the script from a graphical desktop session.
 #
-# The original personal script is not modified by this public version.
+# The script is self-contained and does not depend on any other project.
 
 VERSION="1.0.0"
 
