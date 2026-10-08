@@ -1,0 +1,910 @@
+#!/usr/bin/env bash
+
+set -u
+
+# hotkey-add-journal
+# Add a journal entry to today's Obsidian Daily Note from a keyboard shortcut.
+#
+# BEGINNER SETUP:
+# 1. Edit the configuration block below.
+# 2. Make sure the template contains the configured log heading.
+# 3. Run: ./hotkey-add-journal --check
+# 4. Run the script from a graphical desktop session.
+#
+# The original personal script is not modified by this public version.
+
+VERSION="1.0.0"
+
+# ============================================================
+# USER CONFIGURATION — EDIT THIS BLOCK
+# ============================================================
+
+# Absolute path to your Obsidian vault. $HOME is expanded by the shell.
+VAULT_DIR="${VAULT_DIR:-$HOME/Obsidian}"
+
+# Folder inside the vault that contains notes named YYYY-MM-DD.md.
+JOURNAL_SUBDIR="${JOURNAL_SUBDIR:-Journal}"
+
+# Template path, relative to VAULT_DIR. Use a template with this heading:
+#     ## Log
+TEMPLATE_RELATIVE_PATH="${TEMPLATE_RELATIVE_PATH:-_Templates/Journal - Daily Note.md}"
+
+# The exact heading where normal entries are inserted.
+LOG_HEADING="${LOG_HEADING:-## Log}"
+
+# Optional tag index, relative to VAULT_DIR. Leave empty if you do not use one.
+TAG_INDEX_RELATIVE_PATH="${TAG_INDEX_RELATIVE_PATH:-TAGS_COUNT.md}"
+
+# Menu program: wofi (Wayland) or rofi (X11/Wayland).
+MENU_TOOL="${MENU_TOOL:-wofi}"
+
+# ============================================================
+# END USER CONFIGURATION
+# ============================================================
+
+TIME="$(date +%H:%M)"
+DATE="$(date +%Y-%m-%d)"
+
+JOURNAL_DIR="$VAULT_DIR/$JOURNAL_SUBDIR"
+DAILY_NOTE="$JOURNAL_DIR/$DATE.md"
+TEMPLATE_FILE="$VAULT_DIR/$TEMPLATE_RELATIVE_PATH"
+
+usage() {
+    cat <<EOF
+hotkey-add-journal $VERSION
+
+Usage:
+  hotkey-add-journal          Open the journal entry menu
+  hotkey-add-journal --check  Check configuration and dependencies
+  hotkey-add-journal --help   Show this help
+  hotkey-add-journal --version Show the version
+EOF
+}
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+check_configuration() {
+    local failed=0 command_name
+    printf 'Checking hotkey-add-journal configuration...\n\n'
+    printf 'Vault:    %s\n' "$VAULT_DIR"
+    printf 'Journal:  %s\n' "$JOURNAL_DIR"
+    printf 'Template: %s\n' "$TEMPLATE_FILE"
+    printf 'Heading:  %s\n' "$LOG_HEADING"
+    printf 'Menu:     %s\n\n' "$MENU_TOOL"
+
+    if [ ! -d "$VAULT_DIR" ]; then
+        printf 'ERROR: vault directory does not exist.\n'
+        failed=1
+    fi
+    if [ ! -d "$JOURNAL_DIR" ]; then
+        printf 'ERROR: journal directory does not exist.\n'
+        failed=1
+    fi
+    if [ ! -f "$TEMPLATE_FILE" ]; then
+        printf 'ERROR: template file does not exist.\n'
+        failed=1
+    elif ! grep -Fqx "$LOG_HEADING" "$TEMPLATE_FILE"; then
+        printf 'ERROR: template does not contain the exact log heading: %s\n' "$LOG_HEADING"
+        failed=1
+    fi
+
+    for command_name in date grep awk sed sort mktemp sha256sum mkdir mv rg yad zenity; do
+        if ! command_exists "$command_name"; then
+            printf 'ERROR: missing command: %s\n' "$command_name"
+            failed=1
+        fi
+    done
+    case "$MENU_TOOL" in
+        wofi|rofi) command_exists "$MENU_TOOL" || { printf 'ERROR: missing menu command: %s\n' "$MENU_TOOL"; failed=1; } ;;
+        *) printf 'ERROR: MENU_TOOL must be wofi or rofi.\n'; failed=1 ;;
+    esac
+
+    if [ "$failed" -eq 0 ]; then
+        printf '\nConfiguration looks good.\n'
+    else
+        printf '\nConfiguration needs attention.\n'
+    fi
+    return "$failed"
+}
+
+case "${1:-}" in
+    --help|-h) usage; exit 0 ;;
+    --version|-V) printf '%s\n' "$VERSION"; exit 0 ;;
+    --check) check_configuration; exit $? ;;
+    "") ;;
+    *) printf 'Unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
+
+menu() {
+    local prompt="${1:-Menu}"
+    if [ "$MENU_TOOL" = "rofi" ]; then
+        rofi -dmenu -p "$prompt"
+    else
+        menu "$prompt"
+    fi
+}
+
+
+# ------------------------------------------------------------
+# HELPER FUNCTIONS
+# ------------------------------------------------------------
+
+# Indent multiline text by two spaces for Markdown.
+indent_text() {
+    while IFS= read -r line; do
+        printf '  %s\n' "$line"
+    done <<< "$1"
+}
+
+parse_sleep_time() {
+    local value="$1"
+    [[ "$value" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]] || return 1
+    printf '%02d:%s\n' "$((10#${BASH_REMATCH[1]}))" "${value#*:}"
+}
+
+format_sleep_duration() {
+    local total="$1" hours minutes
+    hours=$((total / 60))
+    minutes=$((total % 60))
+    if [ "$minutes" -eq 0 ]; then
+        printf '%s hours\n' "$hours"
+    elif [ "$hours" -eq 0 ]; then
+        printf '%s minutes\n' "$minutes"
+    else
+        printf '%s hours and %s minutes\n' "$hours" "$minutes"
+    fi
+}
+
+build_sleep_markdown() {
+    local bed_day="$1" bed="$2" woke="$3" awake_minutes="$4" quality="$5" comment="$6"
+    local bed_date wake_date bed_total woke_total in_bed estimated
+
+    bed_date="$DATE"
+    [ "$bed_day" = "Yesterday" ] && bed_date="$(date -d "$DATE -1 day" +%Y-%m-%d)"
+    bed="$(parse_sleep_time "$bed")" || return 1
+    woke="$(parse_sleep_time "$woke")" || return 1
+    bed_total=$((10#${bed%:*} * 60 + 10#${bed#*:}))
+    woke_total=$((10#${woke%:*} * 60 + 10#${woke#*:}))
+    [ "$bed_total" -ne "$woke_total" ] || return 1
+
+    if [ "$bed_day" = "Today" ] && [ "$woke_total" -le "$bed_total" ]; then
+        wake_date="$(date -d "$DATE +1 day" +%Y-%m-%d)"
+    else
+        wake_date="$DATE"
+    fi
+    if [ "$woke_total" -le "$bed_total" ]; then
+        in_bed=$((woke_total + 1440 - bed_total))
+    else
+        in_bed=$((woke_total - bed_total))
+    fi
+
+    markdown=$'### Sleep\n\n- **Sleep data** #sleep\n'
+    markdown+="  [bed_time:: ${bed_date}T${bed}:00]"$'\n'
+    markdown+="  [woke_up:: ${wake_date}T${woke}:00]"$'\n'
+    markdown+="  Time in bed: $(format_sleep_duration "$in_bed")"$'\n'
+    markdown+="  [time_in_bed_min:: ${in_bed}]"
+
+    if [ "$awake_minutes" != "" ]; then
+        [ "$awake_minutes" -ge 0 ] 2>/dev/null || return 1
+        [ "$awake_minutes" -lt "$in_bed" ] 2>/dev/null || return 1
+        estimated=$((in_bed - awake_minutes))
+        markdown+=$'\n'"  [awake_minutes:: ${awake_minutes}]"
+        markdown+=$'\n'"  [estimated_sleep_min:: ${estimated}]"
+        markdown+=$'\n'"  Estimated sleep: $(format_sleep_duration "$estimated") (approximately ${awake_minutes} minutes awake)"
+    fi
+    [ "$quality" != "" ] && markdown+=$'\n'"  [sleep_quality:: ${quality}]"
+    [ "$comment" != "" ] && markdown+=$'\n'"  Note: ${comment//$'\n'/ }"
+    markdown+=$'\n'
+}
+
+# Compact multiline text window.
+long_text() {
+    local title="$1"
+
+    yad \
+        --text-info \
+        --editable \
+        --title="Journal — $title" \
+        --width=450 \
+        --height=220 \
+        --button="Cancel:1" \
+        --button="Save:0"
+}
+
+
+# ------------------------------------------------------------
+# MAIN MENU
+# ------------------------------------------------------------
+
+choice=$(
+    printf '%s\n' \
+        '📝 Event' \
+        '😴 Sleep' \
+        '🏃 Activity' \
+        '⚡ Energy & mood' \
+        '💡 Idea' \
+        '📌 Reminder' \
+        '☑️ Todo' |
+    menu 'Journal'
+) || exit
+
+[ -z "$choice" ] && exit
+
+markdown=""
+entry_kind="log"
+
+
+# ------------------------------------------------------------
+# CHOICES
+# ------------------------------------------------------------
+
+case "$choice" in
+
+    # --------------------------------------------------------
+    # SLEEP
+    # --------------------------------------------------------
+
+    '😴 Sleep')
+
+        bed_day=$(printf '%s\n' 'Yesterday' 'Today' | menu 'When did you go to bed?') || exit
+        [ -n "$bed_day" ] || exit
+
+        bed=$(yad --entry --title="Journal — Sleep" --text="Went to bed (HH:MM)" --width=450 --button="Cancel:1" --button="Next:0") || exit
+        woke=$(yad --entry --title="Journal — Sleep" --text="Woke up (HH:MM)" --width=450 --button="Cancel:1" --button="Next:0") || exit
+
+        awake_choice=$(printf '%s\n' 'No' 'Yes' | menu 'Were you awake for a longer period during the night?') || exit
+        awake_minutes=""
+        if [ "$awake_choice" = "Yes" ]; then
+            awake_minutes=$(yad --entry --title="Journal — Sleep" --text="Approximately how many minutes were you awake?" --width=450 --button="Cancel:1" --button="Next:0") || exit
+            [[ "$awake_minutes" =~ ^[0-9]+$ ]] || exit
+        elif [ "$awake_choice" != "No" ]; then
+            exit
+        fi
+
+        quality=$(yad --entry --title="Journal — Sleep" --text="Sleep quality (0–100, optional)" --width=450 --button="Cancel:1" --button="Next:0") || exit
+        [ -z "$quality" ] || [[ "$quality" =~ ^[0-9]{1,3}$ && "$quality" -le 100 ]] || exit
+        comment=$(long_text "Sleep — short note (optional)") || exit
+
+        build_sleep_markdown "$bed_day" "$bed" "$woke" "$awake_minutes" "$quality" "$comment" || exit
+        entry_kind="sleep"
+        ;;
+
+    # --------------------------------------------------------
+    # EVENT
+    # --------------------------------------------------------
+
+    '📝 Event')
+
+        gebeurtenis=$(
+            yad \
+                --entry \
+                --title="Journal — Event" \
+                --text="What would you like to record?" \
+                --width=450 \
+                --button="Cancel:1" \
+                --button="Next:0"
+        ) || exit
+
+        [ -z "$gebeurtenis" ] && exit
+
+        description="$(long_text "Event — description")" || exit
+
+        markdown="- **$TIME — $gebeurtenis**"
+
+        if [ -n "$description" ]; then
+            markdown+=$'\n'"$(indent_text "$description")"
+        fi
+        ;;
+
+
+    # --------------------------------------------------------
+    # ACTIVITY
+    # --------------------------------------------------------
+
+    '🏃 Activity')
+
+        categorie=$(
+            printf '%s\n' \
+                '🏃 5MinWalk' \
+                '🚲 Cycling' \
+                '🚶 Walking' \
+                '📷 Photography' \
+                '🧹 Household' \
+                '👥 Social' \
+                '📺 Series' \
+                '🎞️ Film' \
+                '🎮 Game' \
+                '✏️ Other...' |
+            menu 'What kind of activity?'
+        ) || exit
+
+        [ -z "$categorie" ] && exit
+
+
+        # ----------------------------------------------------
+        # SPECIAL QUICK 5MINWALK
+        # ----------------------------------------------------
+
+        if [ "$categorie" = '🏃 5MinWalk' ]; then
+
+            description="$(long_text "5MinWalk — story (optional)")" || exit
+
+            markdown="- **$TIME — 5MinWalk** #5minwalk🏃"
+            markdown+=$'\n'"  [Activity:: 5minwalk]"
+
+            if [ -n "$description" ]; then
+                markdown+=$'\n'"$(indent_text "$description")"
+            fi
+
+
+        # ----------------------------------------------------
+        # STANDARD ACTIVITY
+        # ----------------------------------------------------
+
+        else
+
+            # Cycling records fixed tags and structured route/distance fields.
+            if [ "$categorie" = '🚲 Cycling' ]; then
+                van=$(yad --entry --title="Journal — Cycling" --text="From" --width=450 --button="Cancel:1" --button="Next:0") || exit
+                naar=$(yad --entry --title="Journal — Cycling" --text="To" --width=450 --button="Cancel:1" --button="Next:0") || exit
+                afstand_km=$(yad --entry --title="Journal — Cycling" --text="Distance in km" --width=450 --button="Cancel:1" --button="Next:0") || exit
+                [[ "$afstand_km" =~ ^[0-9]+([.,][0-9]+)?$ ]] || exit
+                afstand_km=${afstand_km//,/.}
+                description="$(long_text "Cycling — description (optional)")" || exit
+
+                markdown="- **$TIME — Cycling trip** #activity #cycling-trip #cycling"
+                markdown+=$'\n'"  [Activity:: cycling]"
+                markdown+=$'\n'"  [From:: $van]"
+                markdown+=$'\n'"  [To:: $naar]"
+                markdown+=$'\n'"  [distance_km:: $afstand_km]"
+                if [ -n "$description" ]; then
+                    markdown+=$'\n'"$(indent_text "$description")"
+                fi
+                entry_kind="bike"
+
+            else
+                if [ "$categorie" = '✏️ Other...' ]; then
+
+                categorie=$(
+                    yad \
+                        --entry \
+                        --title="Journal — Activity" \
+                        --text="Category, for example Obsidian, Linux or gardening:" \
+                        --width=450 \
+                        --button="Cancel:1" \
+                        --button="Next:0"
+                ) || exit
+
+                [ -z "$categorie" ] && exit
+
+                else
+                    # Remove the emoji from the selected category.
+                    categorie="${categorie#* }"
+                fi
+
+
+            if [ "$categorie" = 'Series' ]; then
+                titels=$(yad --entry --title="Journal — Series" --text="Which series? (separate multiple items with commas)" --width=450 --button="Cancel:1" --button="Next:0") || exit
+                [ -n "$titels" ] || exit
+                description="$(long_text "Watching series — description (optional)")" || exit
+                markdown="- **$TIME — Watching series: $titels**"
+                markdown+=$'\n'"  [Activity:: series]"
+                markdown+=$'\n'"  [Media:: series]"
+                markdown+=$'\n'"  [Title:: $titels]"
+                [ -n "$description" ] && markdown+=$'\n'"$(indent_text "$description")"
+            elif [ "$categorie" = 'Film' ]; then
+                titels=$(yad --entry --title="Journal — Film" --text="Which film? (separate multiple items with commas)" --width=450 --button="Cancel:1" --button="Next:0") || exit
+                [ -n "$titels" ] || exit
+                description="$(long_text "Watching film — description (optional)")" || exit
+                markdown="- **$TIME — Watching film: $titels**"
+                markdown+=$'\n'"  [Activity:: film]"
+                markdown+=$'\n'"  [Media:: film]"
+                markdown+=$'\n'"  [Title:: $titels]"
+                [ -n "$description" ] && markdown+=$'\n'"$(indent_text "$description")"
+            else
+            description=$(
+                yad \
+                    --entry \
+                    --title="Journal — Activity" \
+                    --text="What did you do?" \
+                    --width=450 \
+                    --button="Cancel:1" \
+                    --button="Next:0"
+            ) || exit
+
+            [ -z "$description" ] && exit
+
+
+            description="$(long_text "$categorie — description")" || exit
+
+
+            markdown="- **$TIME — $description**"
+            markdown+=$'\n'"  [Activity:: $categorie]"
+
+                if [ -n "$description" ]; then
+                    markdown+=$'\n'"$(indent_text "$description")"
+                fi
+            fi
+            fi
+
+        fi
+        ;;
+
+
+    # --------------------------------------------------------
+    # ENERGY & MOOD
+    # --------------------------------------------------------
+
+    '⚡ Energy & mood')
+
+        energie=$(
+            zenity \
+                --scale \
+                --title="Energy" \
+                --text="How much energy do you have right now?" \
+                --min-value=0 \
+                --max-value=100 \
+                --value=50 \
+                --step=5
+        ) || exit
+
+
+        stemming=$(
+            zenity \
+                --scale \
+                --title="Mood" \
+                --text="How is your mood right now?" \
+                --min-value=0 \
+                --max-value=100 \
+                --value=50 \
+                --step=5
+        ) || exit
+
+
+        description="$(long_text "Energy & mood — description")" || exit
+
+
+        markdown="- **$TIME — Energy and mood** #energy"
+        markdown+=$'\n'"  [Energy:: $energie]"
+        markdown+=$'\n'"  [Mood:: $stemming]"
+
+        if [ -n "$description" ]; then
+            markdown+=$'\n'"$(indent_text "$description")"
+        fi
+        ;;
+
+
+    # --------------------------------------------------------
+    # IDEA
+    # --------------------------------------------------------
+
+    '💡 Idea')
+
+        idee="$(long_text "Idea")" || exit
+
+        [ -z "$idee" ] && exit
+
+
+        first_line="${idee%%$'\n'*}"
+
+        markdown="- **$TIME — 💡 $first_line**"
+
+
+        if [[ "$idee" == *$'\n'* ]]; then
+
+            rest="${idee#*$'\n'}"
+
+            markdown+=$'\n'"$(indent_text "$rest")"
+
+        fi
+        ;;
+
+
+    # --------------------------------------------------------
+    # REMINDER
+    # --------------------------------------------------------
+
+    '📌 Reminder')
+
+        tekst=$(
+            yad \
+                --entry \
+                --title="Journal — Reminder" \
+                --text="What should you remember?" \
+                --width=450 \
+                --button="Cancel:1" \
+                --button="Save:0"
+        ) || exit
+
+        [ -z "$tekst" ] && exit
+
+        markdown="- [ ] **$TIME — 📌 Reminder: $tekst**"
+        ;;
+
+
+    # --------------------------------------------------------
+    # TODO
+    # --------------------------------------------------------
+
+    '☑️ Todo')
+
+        tekst=$(
+            yad \
+                --entry \
+                --title="Journal — Todo" \
+                --text="What do you need to do?" \
+                --width=450 \
+                --button="Cancel:1" \
+                --button="Save:0"
+        ) || exit
+
+        [ -z "$tekst" ] && exit
+
+        markdown="- [ ] $tekst"
+        ;;
+
+
+    *)
+        exit
+        ;;
+
+esac
+
+
+# ------------------------------------------------------------
+# SAFELY SAVE TO THE DAILY NOTE
+# ------------------------------------------------------------
+
+error_message() {
+    yad \
+        --error \
+        --title="Journal — Not saved" \
+        --text="$1" \
+        --button="OK:0"
+}
+
+# Optional tags for this entry. Existing tags are collected from the vault;
+# a new tag can also be entered manually.
+existing_tags=$(
+    {
+        if [ -f "$VAULT_DIR/$TAG_INDEX_RELATIVE_PATH" ]; then
+            # The tag index also preserves tags containing emoji.
+            sed -nE 's/^([^[:space:]]+)[[:space:]]+[0-9]+$/\1/p' \
+                "$VAULT_DIR/$TAG_INDEX_RELATIVE_PATH"
+        fi
+
+        # Also collect tags from Markdown notes throughout the vault.
+        rg \
+            --no-filename \
+            --only-matching \
+            --pcre2 '#(?=[\p{L}\p{N}_])[\p{L}\p{N}_/-]+' \
+            --glob '*.md' \
+            --glob '!.git/**' \
+            --glob '!.obsidian/**' \
+            "$VAULT_DIR" 2>/dev/null || true
+    } |
+    sed -E '/^#[0-9A-Fa-f]{3,8}$/d' |
+    sort -fu
+)
+
+selected_tags=()
+
+add_tag_once() {
+    local tag="$1"
+    tag="${tag#,}"
+    [ -z "$tag" ] && return 0
+    [[ "$tag" == \#* ]] || tag="#$tag"
+
+    case " ${selected_tags[*]} " in
+        *" $tag "*) ;;
+        *) selected_tags+=("$tag") ;;
+    esac
+}
+
+while :; do
+    tag_choice=""
+    tag_action=1
+
+    # Rebuild the list each round: selected tags disappear from the list.
+    tag_options=("No tag")
+    while IFS= read -r tag; do
+        if [ -n "$tag" ]; then
+            case " ${selected_tags[*]} " in
+                *" $tag "*) continue ;;
+            esac
+            # Show only the name; the stored value keeps its leading #.
+            tag_options+=("${tag#\#}")
+        fi
+    done <<< "$existing_tags"
+    chosen_text="${selected_tags[*]:-none}"
+    tag_choice=$(
+        yad \
+            --list \
+            --title="Journal — Tags (optional)" \
+        --text="Choose a tag. Selected: $chosen_text" \
+            --column="Existing tag" \
+            "${tag_options[@]}" \
+            --search-column=1 \
+            --width=700 \
+            --height=720 \
+            --print-column=1 \
+            --button="Next tag:0" \
+            --button="Done:3" \
+            --button="New tag:2" \
+            --button="No tags:1"
+    )
+    tag_action=$?
+
+    # A YAD list can return a trailing | for a single field.
+    tag_choice="${tag_choice%%|*}"
+
+    case "$tag_action" in
+        0)
+            if [ -z "$tag_choice" ] || [ "$tag_choice" = "No tag" ] || [ "$tag_choice" = "No existing tags" ]; then
+                break
+            fi
+            add_tag_once "$tag_choice"
+            ;;
+        1)
+            break
+            ;;
+        3)
+            if [ -n "$tag_choice" ] && [ "$tag_choice" != "No tag" ] && [ "$tag_choice" != "No existing tags" ]; then
+                add_tag_once "$tag_choice"
+            fi
+            break
+            ;;
+        2)
+            new_tag=$(
+                yad \
+                    --entry \
+                    --title="Journal — New tag" \
+                    --text="Enter a new tag, for example #project-x:" \
+                    --width=480 \
+                    --button="Cancel:1" \
+                    --button="Add:0"
+            ) || continue
+
+            new_tag="${new_tag#,}"
+            [ -z "$new_tag" ] && continue
+
+            if [[ "$new_tag" =~ [[:space:]] ]]; then
+                error_message "Tags may not contain spaces:\n\n$new_tag"
+                continue
+            fi
+
+            add_tag_once "$new_tag"
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ "${#selected_tags[@]}" -gt 0 ]; then
+    # Add selected tags to the entry line. Sleep tags belong on the sleep line.
+    if [ "$entry_kind" = "sleep" ]; then
+        sleep_prefix="${markdown%%#sleep*}"
+        sleep_suffix="${markdown#*#sleep}"
+        markdown="${sleep_prefix}#sleep ${selected_tags[*]}${sleep_suffix}"
+    else
+    first_line="${markdown%%$'\n'*}"
+    rest=""
+    if [[ "$markdown" == *$'\n'* ]]; then
+        rest="${markdown#*$'\n'}"
+    fi
+    markdown="$first_line ${selected_tags[*]}"
+    [ -n "$rest" ] && markdown+=$'\n'"$rest"
+    fi
+fi
+
+# Write the entry through a temporary file so quotes, Unicode and newlines
+# remain literal when awk inserts it.
+tmp=""
+template_tmp=""
+entry_tmp=$(mktemp "$JOURNAL_DIR/.journal-entry.XXXXXX") || exit 1
+trap 'rm -f -- "$entry_tmp" "${tmp:-}" "${template_tmp:-}" 2>/dev/null' EXIT
+printf '%s\n' "$markdown" > "$entry_tmp" || exit 1
+
+insert_entry() {
+    local source="$1"
+    local destination="$2"
+
+    awk -v entry_file="$entry_tmp" -v log_heading="$LOG_HEADING" '
+    function write_entry( line) {
+        while ((getline line < entry_file) > 0) print line
+        close(entry_file)
+    }
+    BEGIN {
+        in_log = 0
+        written = 0
+    }
+    $0 == log_heading {
+        print
+        in_log = 1
+        next
+    }
+    in_log && /^## / && !written {
+        print ""
+        write_entry()
+        print ""
+        written = 1
+        in_log = 0
+        print
+        next
+    }
+    {
+        print
+    }
+    END {
+        if (in_log && !written) {
+            print ""
+            write_entry()
+            print ""
+            written = 1
+        }
+        if (!written) exit 42
+    }
+    ' "$source" > "$destination"
+}
+
+insert_sleep() {
+    local source="$1"
+    local destination="$2"
+
+    awk -v entry_file="$entry_tmp" '
+    function write_entry( line) {
+        while ((getline line < entry_file) > 0) print line
+        close(entry_file)
+    }
+    BEGIN {
+        in_frontmatter = 0
+        saw_frontmatter = 0
+        written = 0
+    }
+    NR == 1 && $0 == "---" {
+        print
+        in_frontmatter = 1
+        saw_frontmatter = 1
+        next
+    }
+    in_frontmatter && $0 == "---" && !written {
+        print
+        print ""
+        write_entry()
+        print ""
+        written = 1
+        in_frontmatter = 0
+        next
+    }
+    {
+        print
+    }
+    END {
+        if (!saw_frontmatter || !written) exit 42
+    }
+    ' "$source" > "$destination"
+}
+
+make_new_note() {
+    local destination="$1"
+    local template="$TEMPLATE_FILE"
+    local rendered
+    local weekday month
+    local -a weekdays=(Sunday Monday Tuesday Wednesday Thursday Friday Saturday)
+    local -a months=(January February March April May June July August September October November December)
+
+    [ -f "$template" ] || return 1
+    weekday="${weekdays[$((10#$(date +%w)))]}"
+    month="${months[$((10#$(date +%m) - 1))]}"
+    rendered="$JOURNAL_DIR/.journal-template.XXXXXX"
+    rendered=$(mktemp "$rendered") || return 1
+    template_tmp="$rendered"
+
+    sed \
+        -e "s|{{date:YYYY-MM-DD}}|$DATE|g" \
+        -e "s|{{date:dddd D MMMM YYYY}}|$weekday $(date +%-d) $month $(date +%Y)|g" \
+        "$template" > "$rendered" || return 1
+
+    if [ "$entry_kind" = "sleep" ]; then
+        insert_sleep "$rendered" "$destination" || return 1
+    else
+        insert_entry "$rendered" "$destination" || return 1
+    fi
+}
+
+if [ ! -d "$JOURNAL_DIR" ]; then
+    error_message "The Journal directory does not exist:\n\n$JOURNAL_DIR\n\nNothing was changed."
+    exit 1
+fi
+
+# A lock prevents simultaneous updates. The hash check also protects against
+# another application changing the note immediately before replacement.
+lock_dir="${DAILY_NOTE}.journal-add.lock"
+if ! mkdir -- "$lock_dir" 2>/dev/null; then
+    error_message "This Daily Note is already being updated:\n\n$DAILY_NOTE\n\nNothing was changed."
+    exit 1
+fi
+trap 'rmdir -- "$lock_dir" 2>/dev/null; rm -f -- "$entry_tmp" "${tmp:-}" "${template_tmp:-}" 2>/dev/null' EXIT
+
+created_new_note=0
+if [ ! -f "$DAILY_NOTE" ]; then
+    # Build a complete candidate and link it only while the target is absent.
+    tmp=$(mktemp "${DAILY_NOTE}.tmp.XXXXXX") || exit 1
+    make_new_note "$tmp" || exit 1
+    [ -s "$tmp" ] || exit 1
+
+    if ln -- "$tmp" "$DAILY_NOTE" 2>/dev/null; then
+        rm -f -- "$tmp"
+        tmp=""
+        created_new_note=1
+    else
+        # Another application created the target in the meantime; update it.
+        rm -f -- "$tmp"
+    fi
+fi
+
+if [ ! -f "$DAILY_NOTE" ]; then
+    error_message "The Daily Note could not be created safely:\n\n$DAILY_NOTE\n\nNothing was changed."
+    exit 1
+fi
+
+if [ "$entry_kind" = "sleep" ] && [ "$created_new_note" -eq 0 ] && grep -Eq '(^|[[:space:]])#sleep([[:space:]]|$)' "$DAILY_NOTE"; then
+    error_message "This Daily Note already contains a #sleep entry.\n\nNothing was changed."
+    exit 1
+fi
+
+log_count=$(grep -Fxc -- "$LOG_HEADING" "$DAILY_NOTE")
+if [ "$log_count" -ne 1 ]; then
+    error_message "Expected exactly one section '$LOG_HEADING'.\n\nFound: $log_count\n\nNothing was changed."
+    exit 1
+fi
+
+# A newly created note already contains the entry. Existing notes are updated.
+if [ "$created_new_note" -eq 1 ]; then
+    :
+else
+# If the note changes concurrently, rebuild from the current version.
+# Never blindly overwrite a changed version.
+for attempt in 1 2 3; do
+    before_hash=$(sha256sum -- "$DAILY_NOTE" | awk '{print $1}') || exit 1
+    if [ "$entry_kind" = "sleep" ] && grep -Eq '(^|[[:space:]])#sleep([[:space:]]|$)' "$DAILY_NOTE"; then
+        error_message "This Daily Note already contains a #sleep entry.\n\nNothing was changed."
+        exit 1
+    fi
+    tmp=$(mktemp "${DAILY_NOTE}.tmp.XXXXXX") || exit 1
+
+    if [ "$entry_kind" = "sleep" ]; then
+        insert_function=insert_sleep
+    else
+        insert_function=insert_entry
+    fi
+
+    if ! "$insert_function" "$DAILY_NOTE" "$tmp" || [ ! -s "$tmp" ]; then
+        rm -f -- "$tmp"
+        error_message "The Daily Note does not contain one safe, unique section '$LOG_HEADING'.\n\nNothing was changed."
+        exit 1
+    fi
+
+    after_hash=$(sha256sum -- "$DAILY_NOTE" | awk '{print $1}') || exit 1
+    if [ "$before_hash" != "$after_hash" ]; then
+        rm -f -- "$tmp"
+        continue
+    fi
+
+    mv -- "$tmp" "$DAILY_NOTE"
+    break
+done
+
+if [ "$attempt" -gt 3 ]; then
+    error_message "The Daily Note changed while it was being updated.\n\nNothing was overwritten; please try again."
+    exit 1
+fi
+fi
+
+
+# Small desktop notification.
+yad \
+    --notification \
+    --text="Saved to:\n$DAILY_NOTE" \
+    --timeout=2
